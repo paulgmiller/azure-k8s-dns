@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"time"
 
 	// Core Kubernetes types
 	corev1 "k8s.io/api/core/v1"
@@ -25,20 +24,28 @@ import (
 	"github.com/Azure/go-autorest/autorest/to"
 )
 
-// AzureDNSConfig holds Azure-specific configuration for DNS updates.
-type AzureDNSConfig struct {
-	SubscriptionID string
-	ResourceGroup  string
-	ZoneName       string // e.g. "myzone.com"
-	// If your "ZoneID" is different from the zone name, or you want to store extra references, add them here.
-	// ...
+
+
+type dnsClient interface {
+	UpsertDNSRecords(ctx context.Context, dnsName string, ipList []string) error 
 }
 
+
 // Reconciler reconciles changes to Services and Pods
-type Reconciler struct {
+type ServiceReconciler struct {
 	client.Client
-	DNSClient *dns.RecordSetsClient
-	AzureDNS  AzureDNSConfig
+	Scheme *runtime.Scheme
+	dns dnsClient 
+
+}
+
+//endpoints reconciler. 
+
+
+type PodReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+	dns dnsClient 
 }
 
 // +kubebuilder:rbac:groups="",resources=pods;services,verbs=get;list;watch
@@ -84,22 +91,30 @@ func main() {
 		log.Fatalf("Failed to get Azure dns client: %v", err)
 	}
 
+	cfg := AzureDNSConfig{
+		SubscriptionID: *subscriptionID,
+		ResourceGroup:  *resourceGroup,
+		ZoneName:       *zoneName,
+		dnsClient:      dnsClient,
+	}
 	// Initialize the reconciler with the manager client
-	r := &Reconciler{
+	pr := &PodReconciler{
 		Client:    mgr.GetClient(),
-		DNSClient: dnsClient,
-		AzureDNS: AzureDNSConfig{
-			SubscriptionID: *subscriptionID,
-			ResourceGroup:  *resourceGroup,
-			ZoneName:       *zoneName,
-		},
+		Scheme:    mgr.GetScheme(),
+		dns: cfg,
+	}
+
+	sr := &ServiceReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		dns: cfg,
 	}
 
 	// Setup watches on Pods and Services
 	// Services:
 	err = ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Service{}).
-		Complete(r)
+		Complete(sr)
 	if err != nil {
 		log.Fatalf("Unable to create service controller: %v", err)
 	}
@@ -107,7 +122,7 @@ func main() {
 	// Pods:
 	err = ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Pod{}).
-		Complete(r)
+		Complete(pr)
 	if err != nil {
 		log.Fatalf("Unable to create pod controller: %v", err)
 	}
@@ -120,17 +135,21 @@ func main() {
 }
 
 // Reconcile handles changes to Services or Pods
-func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+func (r *ServiceReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	// Requeue interval if we want to re-check things periodically
-	requeueInterval := 30 * time.Second
 	var svc corev1.Service
-	var pod corev1.Pod
 
 	// We don't know if it's a Service or Pod just by the Request, so let's try each.
 
 	// 1) Try to fetch a Service
 	err := r.Get(ctx, req.NamespacedName, &svc)
-	if err == nil {
+	if err != nil {
+		//todo finalizer?
+		return reconcile.Result{}, client.IgnoreNotFound(err)
+	}
+
+	
+
 		// It's a Service
 		if svc.Spec.ClusterIP == "None" {
 			// This is a HEADLESS service -> Create/update A/AAAA records for the Endpoints
@@ -139,7 +158,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			fmt.Printf("Reconciling headless Service %s/%s ...\n", svc.Namespace, svc.Name)
 			// For a standard approach: serviceName.namespace + .yourBaseDomain = DNS name
 			// e.g. myservice.default.myzone.com
-			dnsName := fmt.Sprintf("%s.%s", svc.Name, r.AzureDNS.ZoneName)
+			dnsName := fmt.Sprintf("%s.%s.svc", svc.Name, r.AzureDNS.ZoneName)
 			// In many real setups, you might prefer <service>.<namespace>.svc.myzone.com or something
 			// fully matching your cluster’s DNS. For demonstration, we do a direct subdomain.
 			ipList, err := r.getPodIPsForHeadlessService(ctx, &svc)
@@ -155,19 +174,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 				fmt.Printf("Successfully updated DNS for headless Service %s/%s -> %v\n",
 					svc.Namespace, svc.Name, ipList)
 			}
-		}
+		
 		// Not headless => do nothing for now
 		return reconcile.Result{}, nil
 	}
+}
+
+func (r *PodReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 
 	// 2) Try to fetch a Pod
+	var pod corev1.Pod
 	err = r.Get(ctx, req.NamespacedName, &pod)
 	if err == nil {
 		// It's a Pod
 		// In some scenarios, you might want each Pod to get a DNS entry like:
 		// podName.namespace.yourzone.com
 		// or an annotation-based approach: if pod has an annotation `dns-publish=1`, then publish it
-		if pod.Annotations["azure-dns-publish"] == "true" {
 			fmt.Printf("Reconciling Pod %s/%s for DNS publishing...\n", pod.Namespace, pod.Name)
 			dnsName := fmt.Sprintf("%s.%s.%s", pod.Name, pod.Namespace, r.AzureDNS.ZoneName)
 			// Possibly handle multiple IP addresses, e.g. for dual-stack
@@ -190,95 +212,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	return reconcile.Result{}, nil
 }
 
-// upsertDNSRecords handles both A (IPv4) and AAAA (IPv6) upserts for a given DNS name
-func (r *Reconciler) upsertDNSRecords(ctx context.Context, dnsName string, ipList []string) error {
-	// We separate IPv4 vs. IPv6 addresses for the upsert calls.
-	var ipv4Addrs []string
-	var ipv6Addrs []string
-	for _, ip := range ipList {
-		if strings.Count(ip, ":") >= 2 {
-			ipv6Addrs = append(ipv6Addrs, ip)
-		} else {
-			ipv4Addrs = append(ipv4Addrs, ip)
-		}
-	}
 
-	// Upsert A records (if any)
-	if len(ipv4Addrs) > 0 {
-		if err := r.createOrUpdateARecordSet(ctx, dnsName, ipv4Addrs); err != nil {
-			return fmt.Errorf("error upserting A records: %w", err)
-		}
-	}
-	// Upsert AAAA records (if any)
-	if len(ipv6Addrs) > 0 {
-		if err := r.createOrUpdateAAAARecordSet(ctx, dnsName, ipv6Addrs); err != nil {
-			return fmt.Errorf("error upserting AAAA records: %w", err)
-		}
-	}
 
-	// If there are no addresses, you might want to delete the DNS record or set TTL=0.
-	// That is left as an exercise for your environment's preference.
 
-	return nil
-}
-
-// createOrUpdateARecordSet wraps the Azure DNS client for an A record.
-func (r *Reconciler) createOrUpdateARecordSet(ctx context.Context, dnsName string, ips []string) error {
-	// Build ARecords from the IP list
-	var aRecords []*dns.ARecord
-	for _, ip := range ips {
-		ipCopy := ip // avoid referencing the loop variable
-		aRecords = append(aRecords, &dns.ARecord{IPv4Address: &ipCopy})
-	}
-
-	rs := dns.RecordSet{
-		Properties: &dns.RecordSetProperties{
-			TTL:      to.Int64Ptr(300),
-			ARecords: aRecords,
-		},
-	}
-
-	_, err := r.DNSClient.CreateOrUpdate(
-		ctx,
-		r.AzureDNS.ResourceGroup,
-		r.AzureDNS.ZoneName,
-		dns.RecordTypeA,
-		dnsName, // relative record name or FQDN minus the zone?
-		rs,
-		&dns.RecordSetsClientCreateOrUpdateOptions{},
-	)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-// createOrUpdateAAAARecordSet wraps the Azure DNS client for an AAAA record.
-func (r *Reconciler) createOrUpdateAAAARecordSet(ctx context.Context, dnsName string, ips []string) error {
-	var aaaaRecords []*dns.AaaaRecord
-	for _, ip := range ips {
-		ipCopy := ip
-		aaaaRecords = append(aaaaRecords, &dns.AaaaRecord{IPv6Address: &ipCopy})
-	}
-
-	rs := dns.RecordSet{
-		Properties: &dns.RecordSetProperties{
-			TTL:         to.Int64Ptr(300),
-			AaaaRecords: aaaaRecords,
-		},
-	}
-
-	_, err := r.DNSClient.CreateOrUpdate(
-		ctx,
-		r.AzureDNS.ResourceGroup,
-		r.AzureDNS.ZoneName,
-		dns.RecordTypeAAAA,
-		dnsName,
-		rs,
-		&dns.RecordSetsClientCreateOrUpdateOptions{},
-	)
-	return err
-}
 
 // getPodIPsForHeadlessService queries Pods that match the Service’s selector
 func (r *Reconciler) getPodIPsForHeadlessService(ctx context.Context, svc *corev1.Service) ([]string, error) {
