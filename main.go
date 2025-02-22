@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"os"
+	"log"
 	"strings"
 	"time"
 
@@ -12,7 +12,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
 	// Kubebuilder/controller-runtime imports
@@ -21,8 +20,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	// Azure DNS SDK
-	dns "github.com/Azure/azure-sdk-for-go/services/dns/mgmt/2018-05-01/dns"
-	"github.com/Azure/go-autorest/autorest/azure/auth"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	dns "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/privatedns/armprivatedns"
 	"github.com/Azure/go-autorest/autorest/to"
 )
 
@@ -38,10 +37,8 @@ type AzureDNSConfig struct {
 // Reconciler reconciles changes to Services and Pods
 type Reconciler struct {
 	client.Client
-	Scheme        *runtime.Scheme
-	DNSClient     dns.RecordSetsClient
-	AzureDNS      AzureDNSConfig
-	K8sCoreClient *kubernetes.Clientset
+	DNSClient *dns.RecordSetsClient
+	AzureDNS  AzureDNSConfig
 }
 
 // +kubebuilder:rbac:groups="",resources=pods;services,verbs=get;list;watch
@@ -56,8 +53,7 @@ func main() {
 
 	// Basic validation
 	if *subscriptionID == "" || *resourceGroup == "" || *zoneName == "" {
-		fmt.Println("All flags -subscription, -resourcegroup, -zoneName are required.")
-		os.Exit(1)
+		log.Fatal("All flags -subscription, -resourcegroup, -zoneName are required.")
 	}
 
 	// Create an in-cluster config if running in cluster, or fallback to default config.
@@ -67,7 +63,7 @@ func main() {
 		// Fallback out-of-cluster (dev mode)
 		cfg, err = rest.InClusterConfig()
 		if err != nil {
-			panic(fmt.Sprintf("Unable to get Kubernetes config: %v", err))
+			log.Fatalf("Unable to get Kubernetes config: %v", err)
 		}
 	}
 
@@ -76,36 +72,27 @@ func main() {
 		Scheme: schemeSetup(),
 	})
 	if err != nil {
-		panic(fmt.Sprintf("Unable to start manager: %v", err))
+		log.Fatalf("Unable to start manager: %v", err)
 	}
 
-	// Create Azure authorizer
-	authorizer, err := auth.NewAuthorizerFromEnvironment()
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
-		panic(fmt.Sprintf("failed to create authorizer: %v", err))
+		log.Fatalf("Failed to get Azure credentials: %v", err)
 	}
-
-	// Initialize the Azure DNS client
-	dnsClient := dns.NewRecordSetsClient(*subscriptionID)
-	dnsClient.Authorizer = authorizer
-
-	// Create a kubernetes core clientset for additional lookups if needed
-	k8sCoreClient, err := kubernetes.NewForConfig(cfg)
+	dnsClient, err := dns.NewRecordSetsClient(*subscriptionID, cred, nil)
 	if err != nil {
-		panic(fmt.Sprintf("failed to create k8s core client: %v", err))
+		log.Fatalf("Failed to get Azure dns client: %v", err)
 	}
 
 	// Initialize the reconciler with the manager client
 	r := &Reconciler{
 		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
 		DNSClient: dnsClient,
 		AzureDNS: AzureDNSConfig{
 			SubscriptionID: *subscriptionID,
 			ResourceGroup:  *resourceGroup,
 			ZoneName:       *zoneName,
 		},
-		K8sCoreClient: k8sCoreClient,
 	}
 
 	// Setup watches on Pods and Services
@@ -114,7 +101,7 @@ func main() {
 		For(&corev1.Service{}).
 		Complete(r)
 	if err != nil {
-		panic(fmt.Sprintf("Unable to create service controller: %v", err))
+		log.Fatalf("Unable to create service controller: %v", err)
 	}
 
 	// Pods:
@@ -122,13 +109,13 @@ func main() {
 		For(&corev1.Pod{}).
 		Complete(r)
 	if err != nil {
-		panic(fmt.Sprintf("Unable to create pod controller: %v", err))
+		log.Fatalf("Unable to create pod controller: %v", err)
 	}
 
 	// Start the manager
 	fmt.Println("Starting manager...")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		panic(fmt.Sprintf("Unable to start manager: %v", err))
+		log.Fatalf("Unable to start manager: %v", err)
 	}
 }
 
@@ -238,16 +225,16 @@ func (r *Reconciler) upsertDNSRecords(ctx context.Context, dnsName string, ipLis
 // createOrUpdateARecordSet wraps the Azure DNS client for an A record.
 func (r *Reconciler) createOrUpdateARecordSet(ctx context.Context, dnsName string, ips []string) error {
 	// Build ARecords from the IP list
-	var aRecords []dns.ARecord
+	var aRecords []*dns.ARecord
 	for _, ip := range ips {
 		ipCopy := ip // avoid referencing the loop variable
-		aRecords = append(aRecords, dns.ARecord{Ipv4Address: &ipCopy})
+		aRecords = append(aRecords, &dns.ARecord{IPv4Address: &ipCopy})
 	}
 
 	rs := dns.RecordSet{
-		RecordSetProperties: &dns.RecordSetProperties{
+		Properties: &dns.RecordSetProperties{
 			TTL:      to.Int64Ptr(300),
-			ARecords: &aRecords,
+			ARecords: aRecords,
 		},
 	}
 
@@ -255,11 +242,10 @@ func (r *Reconciler) createOrUpdateARecordSet(ctx context.Context, dnsName strin
 		ctx,
 		r.AzureDNS.ResourceGroup,
 		r.AzureDNS.ZoneName,
+		dns.RecordTypeA,
 		dnsName, // relative record name or FQDN minus the zone?
-		dns.A,
 		rs,
-		"", // Etag
-		"",
+		&dns.RecordSetsClientCreateOrUpdateOptions{},
 	)
 	if err != nil {
 		return err
@@ -269,16 +255,16 @@ func (r *Reconciler) createOrUpdateARecordSet(ctx context.Context, dnsName strin
 
 // createOrUpdateAAAARecordSet wraps the Azure DNS client for an AAAA record.
 func (r *Reconciler) createOrUpdateAAAARecordSet(ctx context.Context, dnsName string, ips []string) error {
-	var aaaaRecords []dns.AaaaRecord
+	var aaaaRecords []*dns.AaaaRecord
 	for _, ip := range ips {
 		ipCopy := ip
-		aaaaRecords = append(aaaaRecords, dns.AaaaRecord{Ipv6Address: &ipCopy})
+		aaaaRecords = append(aaaaRecords, &dns.AaaaRecord{IPv6Address: &ipCopy})
 	}
 
 	rs := dns.RecordSet{
-		RecordSetProperties: &dns.RecordSetProperties{
+		Properties: &dns.RecordSetProperties{
 			TTL:         to.Int64Ptr(300),
-			AaaaRecords: &aaaaRecords,
+			AaaaRecords: aaaaRecords,
 		},
 	}
 
@@ -286,11 +272,10 @@ func (r *Reconciler) createOrUpdateAAAARecordSet(ctx context.Context, dnsName st
 		ctx,
 		r.AzureDNS.ResourceGroup,
 		r.AzureDNS.ZoneName,
+		dns.RecordTypeAAAA,
 		dnsName,
-		dns.AAAA,
 		rs,
-		"",
-		"",
+		&dns.RecordSetsClientCreateOrUpdateOptions{},
 	)
 	return err
 }
