@@ -19,9 +19,9 @@ They are better at ratelimiting, charging and hopefully debugging that us.
 ## Proposal 
 * Create a azure private dns zone in the mc group attach it to the cluster vnet. DNS pms say they have a feature to attach to a specific subnet
 * The controller in this github will try and full fill the [k8s dns spec](https://github.com/kubernetes/dns/blob/master/docs/specification.md#22---record-for-schema-version) by 
-** watching services and update zone A/AAAA/Srv records
-** watching endpointsslices and updating recordds when their service is headless (cluster ip == none)
-** Ignoring PTR records for now? (do people actually use this)
+  * watching services and update zone A/AAAA/Srv records
+  * watching endpointsslices and updating recordds when their service is headless (cluster ip == none) 
+  * Ignoring PTR records for now? (do people actually use this)
 * Remove coredns and let normal azure dns server answers.
 
 ## Problems
