@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 
 	// Core Kubernetes types
@@ -14,20 +13,12 @@ import (
 
 	// Kubebuilder/controller-runtime imports
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	// Azure DNS SDK
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/privatedns/armprivatedns"
 	dns "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/privatedns/armprivatedns"
 )
-
-type dnsClient interface {
-	UpsertDNSRecords(ctx context.Context, dnsName string, ipList []string) error
-	DeleteDNSRecords(ctx context.Context, dnsName string) error
-}
 
 //https://github.com/kubernetes/dns/blob/master/docs/specification.md
 //Goal is to pass as many of these as possible.
@@ -43,12 +34,6 @@ type dnsClient interface {
 //TODO endpoint slices controller for headless
 //TODO SRV records
 //TODO PTR records
-
-type ServiceReconciler struct {
-	client.Client
-	Scheme *runtime.Scheme
-	dns    dnsClient
-}
 
 // +kubebuilder:rbac:groups="",resources=pods;services,verbs=get;list;watch
 
@@ -66,15 +51,9 @@ func main() {
 		log.Fatal("All flags -subscription, -resourcegroup, -zoneName are required.")
 	}
 
-	// Create an in-cluster config if running in cluster, or fallback to default config.
-	// Typically, you'd also allow for out-of-cluster config via e.g. ~/.kube/config
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
-		// Fallback out-of-cluster (dev mode)
-		cfg, err = rest.InClusterConfig()
-		if err != nil {
-			log.Fatalf("Unable to get Kubernetes config: %v", err)
-		}
+		log.Fatalf("Unable to get Kubernetes config: %v", err)
 	}
 
 	// Create the manager
@@ -118,7 +97,7 @@ func main() {
 		log.Fatalf("Unable to create service controller: %v", err)
 	}
 
-	fmt.Println("Starting manager...")
+	log.Println("Starting manager...")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Fatalf("Unable to start manager: %v", err)
 	}
@@ -144,68 +123,9 @@ func MustSetTxTVerion(ctx context.Context, cfg *AzureDNSConfig) {
 	}
 }
 
-const finalizer = "dns.azure.com"
-
-// Reconcile handles changes to Services or Pods
-func (r *ServiceReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-	// Requeue interval if we want to re-check things periodically
-	var svc corev1.Service
-	err := r.Get(ctx, req.NamespacedName, &svc)
-	if err != nil {
-		return reconcile.Result{}, client.IgnoreNotFound(err)
-	}
-
-	// Not ding headless services yet.
-	if svc.Spec.ClusterIP == "None" {
-		// maybe send namespacedname on a channel to endpoint reconciler?
-		log.Printf("Ignoring Headless service %s/%s", svc.Namespace, svc.Name)
-		return reconcile.Result{}, nil
-	}
-
-	dnsName := fmt.Sprintf("%s.%s.svc", svc.Name, svc.Namespace)
-
-	if svc.DeletionTimestamp != nil {
-		log.Printf("Deleting Service %s/%s ...\n", svc.Namespace, svc.Name)
-		//send a message to headless to cleanup or do headless ourselves?
-		if err := r.dns.DeleteDNSRecords(ctx, dnsName); err != nil {
-			return reconcile.Result{}, err
-		}
-		//TODO clone service so we don't mutate cache
-		controllerutil.RemoveFinalizer(&svc, finalizer) //other options instead for finalizers. Perioidic relist and garbage collect
-		if err := r.Update(ctx, &svc); err != nil {
-			return reconcile.Result{}, err
-		}
-	}
-
-	log.Printf("Reconciling Service %s/%s ...\n", svc.Namespace, svc.Name)
-	// In many real setups, you might prefer <service>.<namespace>.svc.myzone.com or something
-	// fully matching your cluster’s DNS. For demonstration, we do a direct subdomain.
-
-	//TODO clone service so we don't mutate cache
-	controllerutil.AddFinalizer(&svc, finalizer) //other options instead for finalizers. Perioidic relist and garbage collect
-	if err := r.Update(ctx, &svc); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	// Upsert A/AAAA record sets in Azure
-	if err := r.dns.UpsertDNSRecords(ctx, dnsName, svc.Spec.ClusterIPs); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	log.Printf("Successfully updated DNS for headless Service %s/%s -> %v", svc.Namespace, svc.Name, svc.Spec.ClusterIPs)
-	return reconcile.Result{}, nil
-}
-
 // schemeSetup sets up the Scheme for corev1 types and any additional CRDs
 func schemeSetup() *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(corev1.AddToScheme(scheme))
-
-	// If you had custom resources, you'd add them here:
-	// utilruntime.Must(mycrdv1.AddToScheme(scheme))
-
-	// For older cluster-runtime usage, you might also do:
-	// scheme.AddKnownTypes(schema.GroupVersion{Group: "", Version: "v1"}, &corev1.Service{}, &corev1.Pod{})
-	// ...
 	return scheme
 }
