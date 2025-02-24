@@ -11,17 +11,17 @@ import (
 )
 
 // AzureDNSConfig holds Azure-specific configuration for DNS updates.
-type azureDNS struct {
+type AzureDNSConfig struct {
 	SubscriptionID string
 	ResourceGroup  string
-	ZoneName       string // e.g. "myzone.com"
+	ZoneName       string
 	DNSClient      *dns.RecordSetsClient
-	// If your "ZoneID" is different from the zone name, or you want to store extra references, add them here.
-	// ...
+	//TTL?
+	//Zone Id?
 }
 
 // upsertDNSRecords handles both A (IPv4) and AAAA (IPv6) upserts for a given DNS name
-func (r *azureDNS) UpsertDNSRecords(ctx context.Context, dnsName string, ipList []string) error {
+func (r *AzureDNSConfig) UpsertDNSRecords(ctx context.Context, dnsName string, ipList []string) error {
 	// We separate IPv4 vs. IPv6 addresses for the upsert calls.
 	var ipv4Addrs []string
 	var ipv6Addrs []string
@@ -52,8 +52,22 @@ func (r *azureDNS) UpsertDNSRecords(ctx context.Context, dnsName string, ipList 
 	return nil
 }
 
+func (r *AzureDNSConfig) DeleteDNSRecords(ctx context.Context, dnsName string) error {
+	// Delete A records
+	if _, err := r.DNSClient.Delete(ctx, r.ResourceGroup, r.ZoneName, dns.RecordTypeA, dnsName, &dns.RecordSetsClientDeleteOptions{}); err != nil {
+		return fmt.Errorf("error deleting A records: %w", err)
+	}
+
+	// Delete AAAA records
+	if _, err := r.DNSClient.Delete(ctx, r.ResourceGroup, r.ZoneName, dns.RecordTypeAAAA, dnsName, &dns.RecordSetsClientDeleteOptions{}); err != nil {
+		return fmt.Errorf("error deleting AAAA records: %w", err)
+	}
+
+	return nil
+}
+
 // createOrUpdateARecordSet wraps the Azure DNS client for an A record.
-func (r *azureDNS) createOrUpdateARecordSet(ctx context.Context, dnsName string, ips []string) error {
+func (r *AzureDNSConfig) createOrUpdateARecordSet(ctx context.Context, dnsName string, ips []string) error {
 	// Build ARecords from the IP list
 	var aRecords []*dns.ARecord
 	for _, ip := range ips {
@@ -70,8 +84,8 @@ func (r *azureDNS) createOrUpdateARecordSet(ctx context.Context, dnsName string,
 
 	_, err := r.DNSClient.CreateOrUpdate(
 		ctx,
-		r.AzureDNS.ResourceGroup,
-		r.AzureDNS.ZoneName,
+		r.ResourceGroup,
+		r.ZoneName,
 		dns.RecordTypeA,
 		dnsName, // relative record name or FQDN minus the zone?
 		rs,
@@ -84,7 +98,7 @@ func (r *azureDNS) createOrUpdateARecordSet(ctx context.Context, dnsName string,
 }
 
 // createOrUpdateAAAARecordSet wraps the Azure DNS client for an AAAA record.
-func (r *azureDNS) createOrUpdateAAAARecordSet(ctx context.Context, dnsName string, ips []string) error {
+func (r *AzureDNSConfig) createOrUpdateAAAARecordSet(ctx context.Context, dnsName string, ips []string) error {
 	var aaaaRecords []*dns.AaaaRecord
 	for _, ip := range ips {
 		ipCopy := ip
@@ -100,8 +114,8 @@ func (r *azureDNS) createOrUpdateAAAARecordSet(ctx context.Context, dnsName stri
 
 	_, err := r.DNSClient.CreateOrUpdate(
 		ctx,
-		r.AzureDNS.ResourceGroup,
-		r.AzureDNS.ZoneName,
+		r.ResourceGroup,
+		r.ZoneName,
 		dns.RecordTypeAAAA,
 		dnsName,
 		rs,
